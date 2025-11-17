@@ -1,0 +1,413 @@
+import streamlit as st
+import os
+import base64
+import hashlib
+from datetime import datetime
+import tempfile
+from cryptography.fernet import Fernet
+
+# 🔐 BACKBLAZE B2 CONFIGURATION
+B2_CONFIG = {
+    'KEY_ID': '85cf99ffd52a',
+    'APPLICATION_KEY': '005397d0277899393475ff8a8108c70aa69967815c',
+    'BUCKET_NAME': 'securebanking'
+}
+
+st.set_page_config(
+    page_title="Secure Banking - Cloud",
+    page_icon="🏦",
+    layout="wide"
+)
+
+# Simple CSS
+st.markdown("""
+<style>
+    .main-header { font-size: 2.5rem; color: #1E3A8A; text-align: center; }
+    .success-box { background: #D1FAE5; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
+    .info-box { background: #DBEAFE; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
+    .warning-box { background: #FEF3C7; padding: 1rem; border-radius: 10px; margin: 1rem 0; }
+</style>
+""", unsafe_allow_html=True)
+
+class CloudStorage:
+    def __init__(self):
+        self.connected = False
+        self.bucket = None
+        self.connect()
+    
+    def connect(self):
+        """Connect to Backblaze B2"""
+        try:
+            from b2sdk.v2 import B2Api
+            self.api = B2Api()
+            self.api.authorize_account("production", B2_CONFIG['KEY_ID'], B2_CONFIG['APPLICATION_KEY'])
+            self.bucket = self.api.get_bucket_by_name(B2_CONFIG['BUCKET_NAME'])
+            self.connected = True
+            return True, "✅ Connected to Backblaze B2 Cloud!"
+        except Exception as e:
+            self.connected = False
+            return False, f"❌ Cloud connection failed: {str(e)}"
+    
+    def upload_to_cloud(self, file_data, cloud_path):
+        """Upload file to Backblaze B2"""
+        if not self.connected:
+            success, message = self.connect()
+            if not success:
+                return False, message
+        
+        try:
+            self.bucket.upload_bytes(file_data, cloud_path)
+            return True, "✅ File uploaded to cloud successfully!"
+        except Exception as e:
+            return False, f"❌ Cloud upload failed: {str(e)}"
+    
+    def download_from_cloud(self, cloud_path):
+        """Download file from Backblaze B2"""
+        if not self.connected:
+            success, message = self.connect()
+            if not success:
+                return None, message
+        
+        try:
+            # Download to temporary file
+            with tempfile.NamedTemporaryFile(delete=False) as temp_file:
+                temp_path = temp_file.name
+            
+            self.bucket.download_file_by_name(cloud_path, temp_path)
+            
+            # Read downloaded file
+            with open(temp_path, 'rb') as f:
+                file_content = f.read()
+            
+            # Clean up
+            os.unlink(temp_path)
+            
+            return file_content, "✅ File downloaded from cloud!"
+            
+        except Exception as e:
+            return None, f"❌ Cloud download failed: {str(e)}"
+
+class SecureBankingApp:
+    def __init__(self):
+        # Initialize cloud storage
+        self.cloud = CloudStorage()
+        
+        # Initialize encryption
+        if 'fernet_key' not in st.session_state:
+            st.session_state.fernet_key = Fernet.generate_key()
+            st.session_state.fernet = Fernet(st.session_state.fernet_key)
+        
+        # User management
+        if 'users' not in st.session_state:
+            st.session_state.users = {
+                "demo@bank.com": hashlib.sha256("Demo@123".encode()).hexdigest(),
+                "admin@bank.com": hashlib.sha256("Admin@123".encode()).hexdigest()
+            }
+        
+        # File storage (metadata only - actual files in cloud)
+        if 'file_metadata' not in st.session_state:
+            st.session_state.file_metadata = {}
+        
+        # Authentication
+        if 'logged_in' not in st.session_state:
+            st.session_state.logged_in = False
+            st.session_state.current_user = ""
+
+    def hash_password(self, password):
+        return hashlib.sha256(password.encode()).hexdigest()
+
+    def login(self, email, password):
+        if email in st.session_state.users and st.session_state.users[email] == self.hash_password(password):
+            st.session_state.logged_in = True
+            st.session_state.current_user = email
+            return True
+        return False
+
+    def register(self, email, password):
+        if email in st.session_state.users:
+            return False, "User already exists"
+        st.session_state.users[email] = self.hash_password(password)
+        return True, "Registration successful"
+
+    def encrypt_file(self, file_data):
+        return st.session_state.fernet.encrypt(file_data)
+
+    def decrypt_file(self, encrypted_data):
+        return st.session_state.fernet.decrypt(encrypted_data)
+
+    def upload_file(self, uploaded_file):
+        """Upload file to cloud with encryption"""
+        try:
+            # Read and encrypt file
+            file_data = uploaded_file.getvalue()
+            encrypted_data = self.encrypt_file(file_data)
+            
+            # Generate unique IDs
+            file_id = base64.urlsafe_b64encode(os.urandom(16)).decode()[:8]
+            cloud_filename = f"users/{st.session_state.current_user}/{file_id}_{uploaded_file.name}"
+            
+            # Upload to Backblaze B2 Cloud
+            cloud_success, cloud_message = self.cloud.upload_to_cloud(encrypted_data, cloud_filename)
+            
+            if cloud_success:
+                # Store metadata locally
+                if st.session_state.current_user not in st.session_state.file_metadata:
+                    st.session_state.file_metadata[st.session_state.current_user] = {}
+                
+                st.session_state.file_metadata[st.session_state.current_user][file_id] = {
+                    'name': uploaded_file.name,
+                    'cloud_path': cloud_filename,
+                    'size': uploaded_file.size,
+                    'type': uploaded_file.type,
+                    'upload_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'in_cloud': True
+                }
+                
+                return True, file_id, f"✅ {cloud_message}"
+            else:
+                return False, None, f"❌ {cloud_message}"
+            
+        except Exception as e:
+            return False, None, f"❌ Upload failed: {str(e)}"
+
+    def download_file(self, file_id):
+        """Download file from cloud and decrypt"""
+        try:
+            user_files = st.session_state.file_metadata.get(st.session_state.current_user, {})
+            
+            if file_id not in user_files:
+                return False, None, "❌ File not found"
+            
+            file_info = user_files[file_id]
+            
+            # Download from Backblaze B2 Cloud
+            encrypted_data, cloud_message = self.cloud.download_from_cloud(file_info['cloud_path'])
+            
+            if encrypted_data is None:
+                return False, None, f"❌ {cloud_message}"
+            
+            # Decrypt the file
+            decrypted_data = self.decrypt_file(encrypted_data)
+            
+            return True, decrypted_data, file_info
+            
+        except Exception as e:
+            return False, None, f"❌ Download failed: {str(e)}"
+
+    def run(self):
+        st.markdown('<h1 class="main-header">🏦 Secure Banking - Cloud Storage</h1>', unsafe_allow_html=True)
+        
+        # Show cloud status
+        if self.cloud.connected:
+            st.success("☁️ Connected to Backblaze B2 Cloud Storage")
+        else:
+            st.error("❌ Backblaze B2 Cloud Disconnected")
+        
+        if not st.session_state.logged_in:
+            self.show_login()
+        else:
+            self.show_main_app()
+
+    def show_login(self):
+        st.markdown("### 🔐 Login to Cloud Storage")
+        
+        tab1, tab2 = st.tabs(["Login", "Register"])
+        
+        with tab1:
+            with st.form("login_form"):
+                email = st.text_input("Email", value="demo@bank.com")
+                password = st.text_input("Password", type="password", value="Demo@123")
+                login_btn = st.form_submit_button("Login to Cloud")
+                
+                if login_btn:
+                    if self.login(email, password):
+                        st.success("✅ Login successful!")
+                        st.rerun()
+                    else:
+                        st.error("❌ Invalid credentials")
+        
+        with tab2:
+            with st.form("register_form"):
+                new_email = st.text_input("New Email")
+                new_password = st.text_input("New Password", type="password")
+                confirm_password = st.text_input("Confirm Password", type="password")
+                register_btn = st.form_submit_button("Register")
+                
+                if register_btn:
+                    if new_password == confirm_password:
+                        success, message = self.register(new_email, new_password)
+                        if success:
+                            st.success(f"✅ {message}")
+                        else:
+                            st.error(f"❌ {message}")
+                    else:
+                        st.error("❌ Passwords don't match")
+        
+        st.markdown("---")
+        st.info("**Demo Account:** demo@bank.com / Demo@123")
+
+    def show_main_app(self):
+        st.sidebar.success(f"👋 Welcome, {st.session_state.current_user}")
+        
+        # Cloud status in sidebar
+        if self.cloud.connected:
+            st.sidebar.success("☁️ Cloud: CONNECTED")
+        else:
+            st.sidebar.error("☁️ Cloud: DISCONNECTED")
+        
+        # File count
+        user_files = st.session_state.file_metadata.get(st.session_state.current_user, {})
+        st.sidebar.metric("📁 Cloud Files", len(user_files))
+        
+        if st.sidebar.button("🔄 Reconnect Cloud"):
+            success, message = self.cloud.connect()
+            if success:
+                st.sidebar.success(message)
+            else:
+                st.sidebar.error(message)
+            st.rerun()
+        
+        if st.sidebar.button("🚪 Logout"):
+            st.session_state.logged_in = False
+            st.session_state.current_user = ""
+            st.rerun()
+        
+        menu = st.sidebar.radio("Navigation", ["Dashboard", "Upload to Cloud", "Download from Cloud", "My Cloud Files"])
+        
+        if menu == "Dashboard":
+            self.show_dashboard()
+        elif menu == "Upload to Cloud":
+            self.show_upload()
+        elif menu == "Download from Cloud":
+            self.show_download()
+        elif menu == "My Cloud Files":
+            self.show_my_files()
+
+    def show_dashboard(self):
+        st.markdown("## 📊 Cloud Storage Dashboard")
+        
+        user_files = st.session_state.file_metadata.get(st.session_state.current_user, {})
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            if self.cloud.connected:
+                st.success("✅ Your files are securely stored in Backblaze B2 Cloud")
+            else:
+                st.error("�️ Cloud storage unavailable")
+        with col2:
+            st.metric("📁 Files in Cloud", len(user_files))
+        
+        # Cloud status
+        if self.cloud.connected:
+            st.markdown("""
+            <div class="info-box">
+                ☁️ <strong>Backblaze B2 Cloud Status: ACTIVE</strong>
+                <br>• Files are encrypted and stored in cloud
+                <br>• Access your files from anywhere
+                <br>• Enterprise-grade security
+            </div>
+            """, unsafe_allow_html=True)
+        else:
+            st.markdown("""
+            <div class="warning-box">
+                ⚠️ <strong>Backblaze B2 Cloud Status: DISCONNECTED</strong>
+                <br>• Files cannot be uploaded or downloaded
+                <br>• Check your internet connection
+                <br>• Verify Backblaze credentials
+            </div>
+            """, unsafe_allow_html=True)
+
+    def show_upload(self):
+        st.markdown("## 📤 Upload to Cloud Storage")
+        
+        if not self.cloud.connected:
+            st.error("❌ Cannot upload - Cloud storage disconnected")
+            return
+        
+        uploaded_file = st.file_uploader("Choose file to upload to cloud", type=['pdf', 'txt', 'jpg', 'png', 'doc', 'docx'])
+        
+        if uploaded_file:
+            st.write(f"**File:** {uploaded_file.name}")
+            st.write(f"**Size:** {uploaded_file.size:,} bytes")
+            st.write(f"**Type:** {uploaded_file.type}")
+            st.write("**Storage:** 🔒 Encrypted & stored in Backblaze B2 Cloud")
+            
+            if st.button("☁️ Upload to Cloud"):
+                with st.spinner("Encrypting and uploading to cloud..."):
+                    success, file_id, message = self.upload_file(uploaded_file)
+                    
+                    if success:
+                        st.markdown(f"""
+                        <div class="success-box">
+                            {message}
+                        </div>
+                        """, unsafe_allow_html=True)
+                        
+                        st.info(f"**File ID:** `{file_id}`")
+                        st.warning("⚠️ Save this File ID to download from cloud later!")
+                    else:
+                        st.error(message)
+
+    def show_download(self):
+        st.markdown("## 📥 Download from Cloud Storage")
+        
+        if not self.cloud.connected:
+            st.error("❌ Cannot download - Cloud storage disconnected")
+            return
+        
+        file_id = st.text_input("Enter File ID from cloud")
+        
+        if st.button("☁️ Download from Cloud") and file_id:
+            with st.spinner("Downloading from cloud and decrypting..."):
+                success, file_data, message = self.download_file(file_id)
+                
+                if success:
+                    st.markdown("""
+                    <div class="success-box">
+                        ✅ File downloaded from cloud and decrypted!
+                    </div>
+                    """, unsafe_allow_html=True)
+                    
+                    file_info = st.session_state.file_metadata[st.session_state.current_user][file_id]
+                    
+                    st.download_button(
+                        label="📥 Download Decrypted File",
+                        data=file_data,
+                        file_name=f"decrypted_{file_info['name']}",
+                        mime="application/octet-stream"
+                    )
+                    
+                    # Show file info
+                    with st.expander("📄 File Details"):
+                        st.write(f"**Name:** {file_info['name']}")
+                        st.write(f"**File ID:** {file_info['file_id']}")
+                        st.write(f"**Cloud Path:** {file_info['cloud_path']}")
+                        st.write(f"**Uploaded:** {file_info['upload_time']}")
+                        st.write(f"**Size:** {file_info['size']:,} bytes")
+                        
+                else:
+                    st.error(message)
+
+    def show_my_files(self):
+        st.markdown("## 📁 My Cloud Files")
+        
+        user_files = st.session_state.file_metadata.get(st.session_state.current_user, {})
+        
+        if not user_files:
+            st.info("No files in cloud storage yet")
+            return
+        
+        for file_id, file_info in user_files.items():
+            with st.expander(f"📄 {file_info['name']}"):
+                st.write(f"**File ID:** `{file_id}`")
+                st.write(f"**Cloud Path:** `{file_info['cloud_path']}`")
+                st.write(f"**Uploaded:** {file_info['upload_time']}")
+                st.write(f"**Size:** {file_info['size']:,} bytes")
+                st.write(f"**Type:** {file_info['type']}")
+                
+                if st.button(f"📋 Copy File ID", key=f"copy_{file_id}"):
+                    st.code(file_id, language="text")
+
+if __name__ == "__main__":
+    app = SecureBankingApp()
+    app.run()
